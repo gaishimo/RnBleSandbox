@@ -33,21 +33,15 @@ const timeByteData = (d = new Date()) => {
   const hours = d.getHours()
   const minutes = d.getMinutes()
   const seconds = d.getSeconds()
-  return [
-    // yearの下位・上位の順番に注意
-    year & 0xFF,  // 下位8bit, yearが2017の場合: 225(0xE1)
-    year >> 8,  // 上位8bit yearが2017の場合: 7(0x07)
-    month,
-    day,
-    hours,
-    minutes,
-    seconds,
-  ]
+
+  const yearData = new Uint8Array(new Uint16Array([year]).buffer) // 16bit -> 8bit array
+  const otherData = new Uint8Array([month, day, hours, minutes, seconds]) // year以外は全て8bit
+  return [...Array.from(yearData), ...Array.from(otherData)]
 }
 
 const convertTimeValuesToDate = (timeValues: Array<Number>) => {
   const [year1, year2, month, day, hours, minutes, seconds] = timeValues
-  const year = (year2 << 8) + year1
+  const year = new Uint16Array(new Uint8Array([year1, year2]).buffer)[0]  // 8bit -> 16bit
   return new Date(year, month - 1, day, hours, minutes, seconds)
 }
 
