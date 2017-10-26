@@ -97,7 +97,7 @@ export default class App extends Component<{}> {
    * 事前ペアリング
    */
   onPressPairingStart = async () => {
-    this.setState({ action: 1 })
+    this.setState({ action: 1, peripheralId: null, peripheralName: null })
     setTimeout(() => {
       if (this.peripheral == null) {
         Alert.alert('', '機器が見つかりませんでした')
