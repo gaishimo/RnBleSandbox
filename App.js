@@ -11,22 +11,28 @@ import {
   NativeModules,
   NativeEventEmitter,
   Alert,
+  Picker,
 } from 'react-native';
 
-
-const SERVICES = {
-  BLOOD_PRESSURE: '1810'
+const DEVICES = {
+  UA651BLE: 'UA651BLE',
+  HEM9200T: 'HEM9200T',
 }
 
-const CHARACTERISTICS = {
-  BLOOD_PRESSURE_MEASUREMENT: '2A35',
-  BLOOD_PRESSURE_FEATURE: '2A49',
-  DATE_TIME: '2A08',
-}
+const DEVICE_UA651BLE = 'UA651BLE'
+const DEVICE_HEM9200T = 'HEM9200T'
+
+const SERVICE_BLOOD_PRESSURE = '1810'  // common
+const SERVICE_CURRENT_TIME = '1805'  // Omron
+const CHARACTERISTIC_BLOOD_PRESSURE_MEASUREMENT = '2a35' // common
+const CHARACTERISTIC_CURRENT_TIME = '2a2b' // Omron
+const CHARACTERISTIC_DATE_TIME = '2a08'   // A&D
 
 const bleManagerEmitter = new NativeEventEmitter(NativeModules.BleManager)
 
-const timeByteData = (d = new Date()) => {
+const standardCharacteristicUuid = (uuid) => (`0000${uuid}-0000-1000-8000-00805f9b34fb`)
+
+const timeByteDataForAAndD = (d = new Date()) => {
   const year = d.getFullYear()
   const month = d.getMonth() + 1
   const day = d.getDate()
@@ -35,15 +41,35 @@ const timeByteData = (d = new Date()) => {
   const seconds = d.getSeconds()
 
   const yearData = new Uint8Array(new Uint16Array([year]).buffer) // 16bit -> 8bit array
-  const otherData = new Uint8Array([month, day, hours, minutes, seconds]) // year以外は全て8bit
+  const otherData = new Uint8Array([month, day, hours, minutes, seconds])
   return [...Array.from(yearData), ...Array.from(otherData)]
 }
 
-const convertTimeValuesToDate = (timeValues: Array<Number>) => {
+const timeByteDataForOmron = (d = new Date()) => {
+  const year = d.getFullYear()
+  const month = d.getMonth() + 1
+  const day = d.getDate()
+  const hours = d.getHours()
+  const minutes = d.getMinutes()
+  const seconds = d.getSeconds()
+  const dayOfWeek = (d.getDay() + 6) % 7 + 1  // 月曜日から1, 2, 3, 4, 5, 6, 7
+  const yearData = new Uint8Array(new Uint16Array([year]).buffer) // 16bit -> 8bit array
+  const otherData = new Uint8Array([month, day, hours, minutes, seconds, dayOfWeek, 0, 0b10000000])
+  return [...Array.from(yearData), ...Array.from(otherData)]
+}
+
+const convertTimeValuesToDateForAAndD = (timeValues: Array<Number>) => {
   const [year1, year2, month, day, hours, minutes, seconds] = timeValues
   const year = new Uint16Array(new Uint8Array([year1, year2]).buffer)[0]  // 8bit -> 16bit
   return new Date(year, month - 1, day, hours, minutes, seconds)
 }
+
+const convertTimeValuesToDateForOmron = (timeValues: Array<Number>) => {
+  const [year1, year2, month, day, hours, minutes, seconds] = timeValues.slice(0, 7)
+  const year = new Uint16Array(new Uint8Array([year1, year2]).buffer)[0]  // 8bit -> 16bit
+  return new Date(year, month - 1, day, hours, minutes, seconds)
+}
+
 
 const convertToTimeString = (timeValues) => {
   const [year1, year2, month, date, hours, minutes, seconds] = timeValues
@@ -56,11 +82,13 @@ const parseMeasurementValues = (valueArray) => {
   const diastolicPressure = valueArray[3]
   const meanArterialPressure = valueArray[5]
   const timestampArray = valueArray.slice(7, 14)
-  const timestamp = convertTimeValuesToDate(timestampArray)
+  const timestamp = convertTimeValuesToDateForAAndD(timestampArray)
+  const pulseRate = valueArray[14]
   return {
     systolicPressure,
     diastolicPressure,
     meanArterialPressure,
+    pulseRate,
     timestamp,
   }
 }
@@ -68,6 +96,7 @@ const parseMeasurementValues = (valueArray) => {
 export default class App extends Component<{}> {
 
   state = {
+    device: DEVICES.HEM9200T,
     action: null, // 1 2
     peripheralId: null,
     peripheralName: null,
@@ -93,6 +122,20 @@ export default class App extends Component<{}> {
     this.clearInterval()
   }
 
+  get timeSettingService() {
+    if (this.state.device === DEVICES.UA651BLE) {
+      return SERVICE_BLOOD_PRESSURE
+    }
+    return SERVICE_CURRENT_TIME // omron
+  }
+
+  get timeSettingCharacteristic() {
+    if (this.state.device === DEVICES.UA651BLE) {
+      return CHARACTERISTIC_DATE_TIME
+    }
+    return CHARACTERISTIC_CURRENT_TIME
+  }
+
   /*
    * 事前ペアリング
    */
@@ -103,6 +146,7 @@ export default class App extends Component<{}> {
         Alert.alert('', '機器が見つかりませんでした')
       }
     }, 1000 * 5)
+
     await this.startScanning()
     return
   }
@@ -137,17 +181,17 @@ export default class App extends Component<{}> {
   }
 
   async startScanning() {
-    await BleManager.scan([SERVICES.BLOOD_PRESSURE], 5, true)
+    await BleManager.scan([SERVICE_BLOOD_PRESSURE], 5, true)
     console.log('scan started')
   }
 
-  async startNotification() {
+  async startReceivingNotification() {
     await BleManager.startNotification(
       this.peripheral.id,
-      SERVICES.BLOOD_PRESSURE,
-      CHARACTERISTICS.BLOOD_PRESSURE_MEASUREMENT,
+      SERVICE_BLOOD_PRESSURE,
+      CHARACTERISTIC_BLOOD_PRESSURE_MEASUREMENT,
     )
-    console.log('startNotification')
+    console.log('startReceivingNotification')
   }
 
   onDiscoverPeripheral = async (peripheral) => {
@@ -162,34 +206,35 @@ export default class App extends Component<{}> {
         waitingForAdvertising: false,
       })
       await BleManager.stopScan()
-      await this.connectWithTimeSetting()
+      await this.connectAndOperate()
     }
   }
 
-  connectWithTimeSetting = async () => {
+  connectAndOperate = async () => {
+    const action = this.state.action
     try {
+      await BleManager.connect(this.peripheral.id)
+      if (action === 1) {
+        // ペアリング時
+        await BleManager.retrieveServices(this.peripheral.id)
+        console.log('service retrieved')
+        await this.syncTime()
+        Alert.alert('', '血圧計とペアリングされました')
+        await BleManager.disconnect(this.peripheral.id)
+        return
+      }
+
+      // 測定後
+      await BleManager.retrieveServices(this.peripheral.id)
+      console.log('service retrieved')
+      await this.syncTime()
+
+      //このタイミングで初めてペアリングが行われた場合disconnectされてしまうため再度つなぎ直す
       await BleManager.connect(this.peripheral.id)
       await BleManager.retrieveServices(this.peripheral.id)
 
-      // timestampの書き込み
-      const service = SERVICES.BLOOD_PRESSURE
-      const characteristic = CHARACTERISTICS.DATE_TIME
-      const data = timeByteData()
-      console.log('timeByteData:', data)
-      await BleManager.write(this.peripheral.id, service, characteristic, data)
-
-      // 書き込んだものをreadしてみる
-      const timestampValues = await BleManager.read(this.peripheral.id, service, characteristic)
-      console.log('timestampValues:', timestampValues)
-      this.setState({ timestamp: convertTimeValuesToDate(timestampValues) })
-
-      if (this.state.action === 1) {
-        Alert.alert('', '血圧計とペアリング済')
-      }
-
-      if (this.state.action === 2) {
-        // 受信待ち
-        await this.startNotification()
+      if (this.state.device === DEVICE_UA651BLE) {
+        await this.startReceivingNotification()
       }
     } catch (e) {
       console.log(e)
@@ -197,19 +242,73 @@ export default class App extends Component<{}> {
     }
   }
 
+  syncTime = async () => {
+    const service = this.timeSettingService
+    const characteristic = this.timeSettingCharacteristic
+    console.log('service:', service)
+    console.log('characteristic:', characteristic)
+    if (this.state.device === DEVICE_UA651BLE) {
+      // A&Dの場合は常に書き込む
+      const data = timeByteDataForAAndD()
+      console.log('timeByteDataForAAndD:', data)
+      await BleManager.write(this.peripheral.id, service, characteristic, data)
+      return
+    }
+
+    if (this.state.device === DEVICE_HEM9200T) {
+      await BleManager.startNotification(this.peripheral.id, service, characteristic)
+    }
+  }
+
   /*
-   * 測定データを受け取った時
+   * データを受け取った時
    */
   onReceiveCharacteristic = async (args) => {
     console.log('onReceiveCharacteristic args:', args)
-    const measurementValues = args.value
-    console.log('measurementValues:', measurementValues)
-    const measurement = parseMeasurementValues(measurementValues)
-    console.log('measurement:', measurement)
-    this.setState({
-      measurements: [...this.state.measurements, measurement]
-    })
 
+    const characteristic = args.characteristic
+
+    if (characteristic === standardCharacteristicUuid(CHARACTERISTIC_CURRENT_TIME)) {
+      // omron bpmTimeを受け取った場合
+      const timeValues = args.value
+      console.log('timeValues:', timeValues)
+      // const timeValues = await BleManager.read(this.peripheral.id, service, characteristic)
+      const bpmTime = convertTimeValuesToDateForOmron(timeValues)
+      const currentTime = new Date()
+      const isSameDate = bpmTime.getDate() === currentTime.getDate()
+      const minutesDiff = Math.floor(Math.abs((bpmTime.getTime() - currentTime.getTime()) / 1000 / 60))
+      const hoursDiff = Math.floor(minutesDiff / 60)
+      console.log(
+        'isSameDate:', isSameDate,
+        'minutesDiff:', minutesDiff,
+        'hoursDiff:', hoursDiff,
+      )
+      if (
+        isSameDate && minutesDiff >= 10   // 同じ日で10分以上差がある場合
+        || !isSameDate && hoursDiff >= 24   // 日が異なり24時間以上差がある場合
+      ) {
+        // 機器の日付と端末の日付に差分がある場合は書き込む
+        const data = timeByteDataForOmron()
+        console.log('timeByteDataForOmron:', data)
+        try {
+          await BleManager.write(this.peripheral.id, this.timeSettingService, characteristic, data)
+        } catch (e) {
+          console.log(e)
+        }
+      }
+      await this.startReceivingNotification()
+    }
+
+    if (characteristic === standardCharacteristicUuid(CHARACTERISTIC_BLOOD_PRESSURE_MEASUREMENT)) {
+      // 測定値を受け取った場合
+      const measurementValues = args.value
+      console.log('measurementValues:', measurementValues)
+      const measurement = parseMeasurementValues(measurementValues)
+      console.log('measurement:', measurement)
+      this.setState({
+        measurements: [...this.state.measurements, measurement]
+      })
+    }
   }
 
   render() {
@@ -218,6 +317,15 @@ export default class App extends Component<{}> {
         <Text style={styles.title}>
           React Native BLE Sandbox
         </Text>
+        <View style={styles.device}>
+          <Picker
+            selectedValue={this.state.device}
+            onValueChange={value => this.setState({ device: value })}
+          >
+            <Picker.Item label="A&D UA-651BLE" value={DEVICES.UA651BLE} />
+            <Picker.Item label="Omron HEM-9200T" value={DEVICES.HEM9200T} />
+          </Picker>
+        </View>
         <View style={styles.actions}>
           <View style={styles.buttonWrapper}>
             <Button
@@ -247,7 +355,6 @@ export default class App extends Component<{}> {
             <View>
               <Text>Peripheral ID: {this.state.peripheralId}</Text>
               <Text>Peripheral Name: {this.state.peripheralName}</Text>
-              <Text>Timestamp: {this.state.timestamp && this.state.timestamp.toString()}</Text>
             </View>
           }
         </View>
@@ -262,6 +369,7 @@ export default class App extends Component<{}> {
                   <Text>最高血圧(収縮期圧): {measurement.systolicPressure}</Text>
                   <Text>最低血圧(拡張期血圧): {measurement.diastolicPressure}</Text>
                   <Text>平均血圧:{measurement.meanArterialPressure}</Text>
+                  <Text>脈拍数:{measurement.pulseRate}</Text>
                 </View>
               ))
           }
@@ -280,6 +388,9 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 20,
     textAlign: 'center',
+    marginTop: 30,
+  },
+  device: {
     marginTop: 30,
   },
   actions: {
